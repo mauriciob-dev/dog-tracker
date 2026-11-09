@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Dog Tracker</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<style>
+  html, body, #map { height: 100%; margin: 0; }
+  #status {
+    position: absolute; z-index: 1000; top: 10px; left: 50px;
+    background: #fff; padding: 6px 10px; border-radius: 6px;
+    font: 14px system-ui, sans-serif; box-shadow: 0 1px 4px rgba(0,0,0,.4);
+  }
+  #status.off { background: #fde2e2; }
+</style>
+</head>
+<body>
+<div id="status">Conectando…</div>
+<div id="map"></div>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+const HISTORY = 200;
+const HDOP_M = 5; // radio de precisión ≈ HDOP × 5 m
+
+function getKey() {
+  let k = sessionStorage.getItem("key");
+  if (!k) {
+    k = prompt("Clave de acceso:") || "";
+    if (k) sessionStorage.setItem("key", k);
+  }
+  return k;
+}
+function resetKey() { sessionStorage.removeItem("key"); }
+
+const map = L.map("map").setView([4.6, -74.1], 13);
+L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
+  maxZoom: 19,
+  attribution: "&copy; OpenStreetMap",
+}).addTo(map);
+
+const track = L.polyline([], { color: "#2563eb", weight: 3 }).addTo(map);
+let marker = null, circle = null, lastAt = null, device = null, fitted = false;
+const statusEl = document.getElementById("status");
+
+function show(p) {
+  if (device && p.deviceId !== device) return; // un solo perro por ahora
+  device = p.deviceId;
+  const ll = [p.lat, p.lon];
+  if (!marker) {
+    marker = L.marker(ll).addTo(map);
+    circle = L.circle(ll, { radius: 10, color: "#2563eb", weight: 1, fillOpacity: 0.12 }).addTo(map);
+  } else {
+    marker.setLatLng(ll);
+    circle.setLatLng(ll);
+  }
+  circle.setRadius(Math.max((p.hdop ?? 2) * HDOP_M, 5));
+  marker.bindTooltip(p.deviceId);
+  lastAt = new Date(p.recordedAt);
+  if (!fitted) { map.setView(ll, 17); fitted = true; }
+}
+
+function tick() {
+  if (!lastAt) return;
+  const s = Math.max(0, Math.round((Date.now() - lastAt) / 1000));
+  statusEl.textContent = "Última posición hace " + s + " s";
+}
+setInterval(tick, 1000);
+
+async function loadHistory() {
+  const r = await fetch("/positions?limit=" + HISTORY, { headers: { "x-api-key": getKey() } });
+  if (r.status === 401) { resetKey(); throw new Error("clave inválida"); }
+  const rows = (await r.json()).reverse(); // viejo → nuevo
+  rows.forEach(p => {
+    if (device && p.deviceId !== device) return;
+    device = p.deviceId;
+    track.addLatLng([p.lat, p.lon]);
+  });
+  if (rows.length) show(rows[rows.length - 1]);
+  tick();
+}
+
+let delay = 1000;
+function connect() {
+  const proto = location.protocol === "https:" ? "wss" : "ws";
+  const ws = new WebSocket(proto + "://" + location.host + "/ws?key=" + encodeURIComponent(getKey()));
+  ws.onopen = () => { delay = 1000; statusEl.classList.remove("off"); };
+  ws.onmessage = (e) => {
+    const p = JSON.parse(e.data);
+    if (device && p.deviceId !== device) return;
+    track.addLatLng([p.lat, p.lon]);
+    show(p);
+    tick();
+  };
+  ws.onclose = (e) => {
+    statusEl.classList.add("off");
+    statusEl.textContent = "Desconectado, reintentando…";
+    if (e.code === 1008) resetKey(); // clave rechazada: se vuelve a pedir
+    setTimeout(connect, delay);
+    delay = Math.min(delay * 2, 15000);
+  };
+}
+
+loadHistory().catch(e => { statusEl.textContent = e.message; statusEl.classList.add("off"); })
+  .finally(connect);
+</script>
+</body>
+</html>
